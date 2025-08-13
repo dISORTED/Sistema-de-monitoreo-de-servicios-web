@@ -1,6 +1,8 @@
 # app/checker.py
 import asyncio
 import time
+import logging
+import base64
 from typing import Dict, Tuple
 
 import httpx
@@ -14,31 +16,46 @@ from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExp
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 
-# Configurar proveedor de métricas si hay endpoint/token
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 _meter = None
 _status_cache: Dict[str, bool] = {}       # Último estado (True=up, False=down)
-_notified_down: Dict[str, bool] = {}      # Para notificar una sola vez por transición
 _last_latency_ms: Dict[str, float] = {}   # Última latencia por URL
 
 def setup_metrics():
+    """
+    Configura el proveedor de métricas.
+    - Si hay vars de Grafana Cloud: exporta por OTLP/HTTP usando Basic Auth (instance_id:api_key) a /v1/metrics
+    - Si no: crea un proveedor local (las métricas no salen de la app)
+    """
     global _meter, gauge_up, hist_latency
 
-    if settings.OTLP_ENDPOINT and settings.GRAFANA_CLOUD_API_TOKEN:
-        resource = Resource.create({"service.name": settings.SERVICE_NAME})
-        reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(
-                endpoint=settings.OTLP_ENDPOINT,
-                headers={"Authorization": f"Bearer {settings.GRAFANA_CLOUD_API_TOKEN}"},
-                timeout=10_000,
-            ),
-            export_interval_millis=15000,  # 15s
-        )
-        provider = MeterProvider(metric_readers=[reader], resource=resource)
-        metrics.set_meter_provider(provider)
-    else:
-        provider = MeterProvider(resource=Resource.create({"service.name": settings.SERVICE_NAME}))
-        metrics.set_meter_provider(provider)
+    resource = Resource.create({"service.name": settings.SERVICE_NAME})
 
+    readers = []
+    if (
+        settings.OTLP_ENDPOINT_BASE
+        and settings.GRAFANA_CLOUD_INSTANCE_ID
+        and settings.GRAFANA_CLOUD_API_TOKEN
+    ):
+        # Basic Auth = base64(instance_id:api_key)
+        raw = f"{settings.GRAFANA_CLOUD_INSTANCE_ID}:{settings.GRAFANA_CLOUD_API_TOKEN}"
+        basic = base64.b64encode(raw.encode()).decode()
+        base = settings.OTLP_ENDPOINT_BASE.rstrip("/")
+
+        exporter = OTLPMetricExporter(
+            endpoint=f"{base}/v1/metrics",
+            headers={"Authorization": f"Basic {basic}"},
+            timeout=10_000,
+        )
+        readers.append(PeriodicExportingMetricReader(exporter, export_interval_millis=15000))
+
+    if readers:
+        provider = MeterProvider(metric_readers=readers, resource=resource)
+    else:
+        provider = MeterProvider(resource=resource)
+
+    metrics.set_meter_provider(provider)
     _meter = metrics.get_meter("site-monitor")
 
     # Métrica observable de disponibilidad: 1=up, 0=down
@@ -66,19 +83,6 @@ def setup_metrics():
         description="Latencia HTTP por target",
     )
 
-async def _notify_telegram(text: str):
-    if not (settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID):
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            )
-    except Exception:
-        # Si falla, no rompemos el loop de monitoreo.
-        pass
-
 async def _check_one(url: str) -> Tuple[bool, float, int]:
     t0 = time.perf_counter()
     code = 0
@@ -97,7 +101,6 @@ async def monitor_loop():
     # Inicializa caches
     for url in settings.TARGETS:
         _status_cache[url] = False
-        _notified_down[url] = False
         _last_latency_ms[url] = 0.0
 
     while True:
@@ -105,18 +108,19 @@ async def monitor_loop():
         results = await asyncio.gather(*tasks)
 
         for url, (ok, ms, code) in zip(settings.TARGETS, results):
+            old = _status_cache.get(url, None)
             _status_cache[url] = ok
             _last_latency_ms[url] = ms
+
             # Registra latencia
             hist_latency.record(ms, {"target": url, "status_code": code})
 
-            # Alertas a Telegram por transición
-            if not ok and not _notified_down.get(url, False):
-                _notified_down[url] = True
-                await _notify_telegram(f"⚠️ Caída detectada: {url} (status={code}, {ms:.0f} ms)")
-            elif ok and _notified_down.get(url, False):
-                _notified_down[url] = False
-                await _notify_telegram(f"✅ Recuperado: {url} (status={code}, {ms:.0f} ms)")
+            # Loguea transición
+            if old is not None and old != ok:
+                if ok:
+                    logging.info("RECUPERADO %s (status=%s, %.0f ms)", url, code, ms)
+                else:
+                    logging.warning("CAÍDA %s (status=%s, %.0f ms)", url, code, ms)
 
         await asyncio.sleep(settings.CHECK_INTERVAL_SECONDS)
 
