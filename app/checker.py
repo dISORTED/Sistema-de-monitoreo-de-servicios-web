@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
+from urllib.parse import unquote
 
 import httpx
 from opentelemetry import metrics
@@ -43,18 +44,23 @@ def setup_metrics() -> None:
     resource = Resource.create({"service.name": settings.SERVICE_NAME})
     readers = []
 
-    if (
-        settings.OTLP_ENDPOINT_BASE
-        and settings.GRAFANA_CLOUD_INSTANCE_ID
-        and settings.GRAFANA_CLOUD_API_TOKEN
-    ):
+    otlp_headers: Dict[str, str] = {}
+    if settings.OTLP_HEADERS:
+        header_name, _, header_value = settings.OTLP_HEADERS.partition("=")
+        if header_name and header_value:
+            otlp_headers[header_name] = unquote(header_value)
+    elif settings.GRAFANA_CLOUD_INSTANCE_ID and settings.GRAFANA_CLOUD_API_TOKEN:
         raw = f"{settings.GRAFANA_CLOUD_INSTANCE_ID}:{settings.GRAFANA_CLOUD_API_TOKEN}"
         basic = base64.b64encode(raw.encode()).decode()
+        otlp_headers["Authorization"] = f"Basic {basic}"
+
+    if settings.OTLP_ENDPOINT_BASE and otlp_headers:
         base = settings.OTLP_ENDPOINT_BASE.rstrip("/")
+        endpoint = base if base.endswith("/v1/metrics") else f"{base}/v1/metrics"
 
         exporter = OTLPMetricExporter(
-            endpoint=f"{base}/v1/metrics",
-            headers={"Authorization": f"Basic {basic}"},
+            endpoint=endpoint,
+            headers=otlp_headers,
             timeout=10_000,
         )
         readers.append(PeriodicExportingMetricReader(exporter, export_interval_millis=15_000))

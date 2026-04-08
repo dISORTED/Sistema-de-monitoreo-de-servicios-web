@@ -26,8 +26,15 @@ class Settings:
     CRON_SECRET: str = os.getenv("CRON_SECRET", "")
 
     SERVICE_NAME: str = os.getenv("SERVICE_NAME", "site-monitor")
-    # Endpoint base por region (sin / al final). Ej: https://otlp-gateway-prod-sa-east-1.grafana.net
-    OTLP_ENDPOINT_BASE: str = os.getenv("GRAFANA_CLOUD_OTLP_ENDPOINT", "")
+    # Acepta tanto el nombre propio del proyecto como la variable exacta que entrega Grafana.
+    OTLP_ENDPOINT_BASE: str = os.getenv(
+        "GRAFANA_CLOUD_OTLP_ENDPOINT",
+        os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+    )
+    OTLP_HEADERS: str = os.getenv(
+        "GRAFANA_CLOUD_OTLP_HEADERS",
+        os.getenv("OTEL_EXPORTER_OTLP_HEADERS", ""),
+    )
     GRAFANA_CLOUD_INSTANCE_ID: str = os.getenv("GRAFANA_CLOUD_INSTANCE_ID", "")
     GRAFANA_CLOUD_API_TOKEN: str = os.getenv("GRAFANA_CLOUD_API_TOKEN", "")
 
