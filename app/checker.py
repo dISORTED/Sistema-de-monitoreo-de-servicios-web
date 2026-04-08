@@ -1,44 +1,53 @@
-# app/checker.py
 import asyncio
-import time
-import logging
 import base64
-from typing import Dict, Tuple
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
 
 import httpx
-
-from app.settings import settings
-
-# ===== OpenTelemetry (métricas a Grafana Cloud) =====
 from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+
+from app.settings import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 _meter = None
-_status_cache: Dict[str, bool] = {}       # Último estado (True=up, False=down)
-_last_latency_ms: Dict[str, float] = {}   # Última latencia por URL
+_provider: MeterProvider | None = None
+_metrics_ready = False
+_run_lock: asyncio.Lock | None = None
 
-def setup_metrics():
-    """
-    Configura el proveedor de métricas.
-    - Si hay vars de Grafana Cloud: exporta por OTLP/HTTP usando Basic Auth (instance_id:api_key) a /v1/metrics
-    - Si no: crea un proveedor local (las métricas no salen de la app)
-    """
-    global _meter, gauge_up, hist_latency
+_status_cache: Dict[str, bool] = {}
+_last_latency_ms: Dict[str, float] = {}
+_last_status_code: Dict[str, int] = {}
+_last_checked_at: str | None = None
+
+
+def _get_run_lock() -> asyncio.Lock:
+    global _run_lock
+    if _run_lock is None:
+        _run_lock = asyncio.Lock()
+    return _run_lock
+
+
+def setup_metrics() -> None:
+    global _meter, _provider, _metrics_ready, gauge_up, hist_latency
+
+    if _metrics_ready:
+        return
 
     resource = Resource.create({"service.name": settings.SERVICE_NAME})
-
     readers = []
+
     if (
         settings.OTLP_ENDPOINT_BASE
         and settings.GRAFANA_CLOUD_INSTANCE_ID
         and settings.GRAFANA_CLOUD_API_TOKEN
     ):
-        # Basic Auth = base64(instance_id:api_key)
         raw = f"{settings.GRAFANA_CLOUD_INSTANCE_ID}:{settings.GRAFANA_CLOUD_API_TOKEN}"
         basic = base64.b64encode(raw.encode()).decode()
         base = settings.OTLP_ENDPOINT_BASE.rstrip("/")
@@ -48,89 +57,124 @@ def setup_metrics():
             headers={"Authorization": f"Basic {basic}"},
             timeout=10_000,
         )
-        readers.append(PeriodicExportingMetricReader(exporter, export_interval_millis=15000))
+        readers.append(PeriodicExportingMetricReader(exporter, export_interval_millis=15_000))
 
-    if readers:
-        provider = MeterProvider(metric_readers=readers, resource=resource)
-    else:
-        provider = MeterProvider(resource=resource)
-
-    metrics.set_meter_provider(provider)
+    _provider = MeterProvider(metric_readers=readers, resource=resource)
+    metrics.set_meter_provider(_provider)
     _meter = metrics.get_meter("site-monitor")
 
-    # Métrica observable de disponibilidad: 1=up, 0=down
     def _observe_up_callback(options):
         from opentelemetry.metrics import Observation  # type: ignore
-        out = []
-        for url in settings.TARGETS:
-            val = 1 if _status_cache.get(url, False) else 0
-            out.append(Observation(val, {"target": url}))
-        return out
 
-    global gauge_up
+        observations = []
+        for url in settings.TARGETS:
+            value = 1 if _status_cache.get(url, False) else 0
+            observations.append(Observation(value, {"target": url}))
+        return observations
+
     gauge_up = _meter.create_observable_gauge(
         name="target_up",
         callbacks=[_observe_up_callback],
         unit="1",
-        description="Disponibilidad por target (1 up, 0 down)",
+        description="Availability by target (1 up, 0 down)",
     )
 
-    # Histograma de latencia en ms
-    global hist_latency
     hist_latency = _meter.create_histogram(
         name="target_latency_ms",
         unit="ms",
-        description="Latencia HTTP por target",
+        description="HTTP latency by target",
     )
 
-async def _check_one(url: str) -> Tuple[bool, float, int]:
-    t0 = time.perf_counter()
-    code = 0
+    _metrics_ready = True
+
+
+def _ensure_target_state(urls: List[str]) -> None:
+    for url in urls:
+        _status_cache.setdefault(url, False)
+        _last_latency_ms.setdefault(url, 0.0)
+        _last_status_code.setdefault(url, 0)
+
+
+async def _check_one(client: httpx.AsyncClient, url: str) -> Tuple[bool, float, int]:
+    started = time.perf_counter()
+    status_code = 0
+
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url)
-            code = resp.status_code
-            ok = 200 <= code < 400
+        response = await client.get(url)
+        status_code = response.status_code
+        ok = 200 <= status_code < 400
     except Exception:
         ok = False
-    ms = (time.perf_counter() - t0) * 1000.0
-    return ok, ms, code
 
-async def monitor_loop():
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    return ok, latency_ms, status_code
+
+
+async def run_checks(urls: List[str] | None = None) -> List[dict]:
     setup_metrics()
-    # Inicializa caches
-    for url in settings.TARGETS:
-        _status_cache[url] = False
-        _last_latency_ms[url] = 0.0
+    target_urls = urls or settings.TARGETS
 
-    while True:
-        tasks = [asyncio.create_task(_check_one(url)) for url in settings.TARGETS]
-        results = await asyncio.gather(*tasks)
+    if not target_urls:
+        return []
 
-        for url, (ok, ms, code) in zip(settings.TARGETS, results):
-            old = _status_cache.get(url, None)
+    async with _get_run_lock():
+        _ensure_target_state(target_urls)
+
+        async with httpx.AsyncClient(
+            timeout=settings.REQUEST_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        ) as client:
+            tasks = [_check_one(client, url) for url in target_urls]
+            results = await asyncio.gather(*tasks)
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+
+        for url, (ok, latency_ms, status_code) in zip(target_urls, results):
+            previous_status = _status_cache.get(url)
             _status_cache[url] = ok
-            _last_latency_ms[url] = ms
+            _last_latency_ms[url] = latency_ms
+            _last_status_code[url] = status_code
 
-            # Registra latencia
-            hist_latency.record(ms, {"target": url, "status_code": code})
+            hist_latency.record(latency_ms, {"target": url, "status_code": status_code})
 
-            # Loguea transición
-            if old is not None and old != ok:
+            if previous_status is not None and previous_status != ok:
                 if ok:
-                    logging.info("RECUPERADO %s (status=%s, %.0f ms)", url, code, ms)
+                    logging.info("RECOVERED %s (status=%s, %.0f ms)", url, status_code, latency_ms)
                 else:
-                    logging.warning("CAÍDA %s (status=%s, %.0f ms)", url, code, ms)
+                    logging.warning("DOWN %s (status=%s, %.0f ms)", url, status_code, latency_ms)
 
+        global _last_checked_at
+        _last_checked_at = checked_at
+
+        if _provider is not None:
+            _provider.force_flush()
+
+        return get_snapshot(target_urls)
+
+
+async def monitor_loop() -> None:
+    while True:
+        await run_checks()
         await asyncio.sleep(settings.CHECK_INTERVAL_SECONDS)
 
-def get_snapshot():
-    # Para endpoints de API
-    out = []
-    for url in settings.TARGETS:
-        out.append({
-            "target": url,
-            "up": _status_cache.get(url, False),
-            "last_latency_ms": round(_last_latency_ms.get(url, 0.0), 2),
-        })
-    return out
+
+def get_snapshot(urls: List[str] | None = None) -> List[dict]:
+    target_urls = urls or settings.TARGETS
+    snapshot = []
+
+    for url in target_urls:
+        snapshot.append(
+            {
+                "target": url,
+                "up": _status_cache.get(url, False),
+                "last_latency_ms": round(_last_latency_ms.get(url, 0.0), 2),
+                "status_code": _last_status_code.get(url, 0),
+                "checked_at": _last_checked_at,
+            }
+        )
+
+    return snapshot
+
+
+def get_last_checked_at() -> str | None:
+    return _last_checked_at

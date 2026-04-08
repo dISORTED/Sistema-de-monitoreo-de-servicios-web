@@ -1,150 +1,96 @@
-Sistema de Monitoreo de Servicios Web con OpenTelemetry, Prometheus y Grafana Cloud
+# Sistema de monitoreo de servicios web
 
-Este proyecto tiene como objetivo construir una solución de monitoreo simple, eficiente y de bajo costo para evaluar el rendimiento de distintos sitios web mediante el uso de herramientas modernas de observabilidad. La implementación utiliza un exportador personalizado en Python (con FastAPI), OpenTelemetry para la instrumentación, Prometheus como base de datos de series temporales y Grafana Cloud para la visualización de métricas.
+Proyecto de monitoreo simple para medir latencia y disponibilidad de sitios web usando FastAPI, OpenTelemetry y Grafana Cloud.
 
-🌍 Tecnologías utilizadas
+## Stack
 
-Herramienta
+- Python + FastAPI
+- OpenTelemetry Metrics
+- Grafana Cloud OTLP
+- Docker
+- Vercel o Railway
 
-Propósito principal
+## Que cambio en esta version
 
-Python + FastAPI
+La app ahora soporta dos modos:
 
-Exportador de métricas personalizado (medición de latencia HTTP)
+- `background`: mantiene el loop continuo original y sirve bien en Railway, Docker o una VM.
+- `on-demand`: ejecuta chequeos por request o por cron y queda lista para Vercel.
 
-OpenTelemetry SDK (Python)
+Tambien se agrego:
 
-Instrumentación de la aplicación y exportación de métricas
+- Dashboard HTML en `/` y `/dashboard` para screenshots.
+- Endpoint de chequeo programable en `/api/check`.
+- Entrada `index.py` compatible con FastAPI en Vercel.
+- Archivo `vercel.json` con un cron diario seguro para Hobby.
 
-Prometheus (Grafana Cloud)
+## Endpoints
 
-Recolección de métricas OTLP HTTP (time-series database)
+- `/` dashboard HTML
+- `/dashboard` dashboard HTML
+- `/targets` snapshot JSON
+- `/health` estado de la app
+- `/api/check` ejecuta un chequeo y exporta metricas
 
-Grafana Cloud
+## Variables de entorno
 
-Visualización de dashboards y configuración de alertas
+Puedes usar `.env.example` como base.
 
-Railway
+- `TARGETS`: lista CSV de URLs a monitorear
+- `CHECK_INTERVAL_SECONDS`: intervalo del loop continuo
+- `REQUEST_TIMEOUT_SECONDS`: timeout por request saliente
+- `ENABLE_BACKGROUND_MONITOR`: `true` para Railway/Docker, `false` para Vercel
+- `CRON_SECRET`: secreto opcional para proteger `/api/check`
+- `SERVICE_NAME`: nombre del servicio OTEL
+- `GRAFANA_CLOUD_OTLP_ENDPOINT`: endpoint base OTLP de Grafana Cloud
+- `GRAFANA_CLOUD_INSTANCE_ID`: instance id de Grafana Cloud
+- `GRAFANA_CLOUD_API_TOKEN`: token con permisos de metrics:write
 
-Plataforma de despliegue cloud para el exportador (gratuito)
+## Ejecutar local
 
-GitHub Actions
+```bash
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
 
-Automatización CI/CD: test, despliegue y limpieza de secretos
+Si quieres el comportamiento antiguo, deja `ENABLE_BACKGROUND_MONITOR=true`.
 
-🔄 Arquitectura general
+Para sacar screenshots rapidamente:
 
-graph TD
-    A[Usuario/Desarrollador] --> B[FastAPI App (Railway)]
-    B --> C[OpenTelemetry SDK]
-    C --> D[OTLP Exporter]
-    D --> E[Grafana Cloud Prometheus]
-    E --> F[Dashboard Grafana (Latencia p95)]
+- abre `/dashboard?refresh=true`
+- abre `/targets?refresh=true`
+- usa `/docs` si quieres mostrar la API
 
-🔢 Funcionamiento del exportador (FastAPI + OTEL)
+## Deploy en Vercel
 
-Cada cierto intervalo (configurable), la aplicación realiza peticiones HTTP a sitios definidos.
+FastAPI puede desplegarse en Vercel usando `index.py` como entrypoint.
 
-Se registra el tiempo de respuesta de cada sitio, clasificándolo en buckets de latencia en milisegundos (histogram).
+Pasos:
 
-Las métricas generadas incluyen:
+1. Importa el repo en Vercel.
+2. Configura las variables de entorno del archivo `.env.example`.
+3. Deja `ENABLE_BACKGROUND_MONITOR=false`.
+4. Configura `CRON_SECRET` y usa el mismo valor como secret del cron si quieres proteger `/api/check`.
+5. Despliega.
 
-target_latency_ms_milliseconds_bucket
+Notas importantes:
 
-target_info
+- El cron incluido en `vercel.json` corre una vez al dia para que el proyecto siga siendo compatible con Vercel Hobby.
+- Si usas Vercel Pro, puedes cambiar el cron a algo como `*/5 * * * *` para acercarte mas al comportamiento original de Railway.
+- En Vercel no conviene depender de memoria en proceso para mantener un loop infinito.
 
-Estas se exportan en tiempo real a Grafana Cloud (Prometheus) usando el protocolo OTLP (HTTP).
+## Deploy en Railway
 
-📊 Dashboard en Grafana: Latencia p95 por sitio
+Si quieres seguir usando Railway, este repo tambien conserva ese camino:
 
-Descripción del panel
+1. Usa el `Dockerfile`.
+2. Define `ENABLE_BACKGROUND_MONITOR=true`.
+3. Configura las variables OTLP de Grafana Cloud.
 
-Nombre: Latencia p95 por sitio (ultimos 5 minutos)
+## Tests
 
-Query:
-
-histogram_quantile(0.95, sum(rate(target_latency_ms_milliseconds_bucket[5m])) by (le, target))
-
-Actualización: Cada 30 segundos
-
-Etiquetas utilizadas: target, status_code, service_name
-
-Visualización: Panel de líneas por sitio web monitoreado
-
-Objetivo del panel
-
-Este dashboard permite visualizar la latencia p95 (percentil 95) por cada uno de los sitios registrados. Este valor indica que el 95% de las respuestas HTTP fueron menores o iguales a ese tiempo, mostrando tendencias de degradación o mejoras en tiempo real.
-
-Ejemplo de comportamiento observado
-
-https://homer.sii.cl/ con latencias p95 cercanas a 5s
-
-https://sence.gob.cl/ promedio estable cercano a 1s
-
-https://www.stochile.com/ extremadamente rápido, alrededor de 100ms
-
-🚨 Configuración de alertas
-
-Se ha definido una alerta que se dispara cuando la latencia p95 supera un umbral crítico:
-
-Regla de alerta:
-
-Métrica: Latencia p95 por target
-
-Condición: mayor a 3000 ms (3s)
-
-Evaluación: Cada 1 minuto
-
-Persistencia del estado: Al menos 1m consecutivo en condición de alerta
-
-Resultado:
-
-Permite identificar rápidamente cuando un sitio está funcionando lentamente
-
-Se puede extender fácilmente para enviar notificaciones a Slack, correo u otros canales
-
-🛠️ Configuración en Railway
-
-La aplicación está desplegada en Railway como contenedor Docker
-
-Variables de entorno utilizadas:
-
-OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-
-OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-
-GRAFANA_CLOUD_API_TOKEN
-
-SERVICE_NAME
-
-🔄 Repositorio y despliegue
-
-Repositorio: https://github.com/dISORTED/Sistema-de-monitoreo-de-servicios-web
-
-CI/CD:
-
-Validaciones automáticas
-
-Push protegido (secret scanning habilitado)
-
-🔧 Posibles mejoras futuras
-
-Agregar métrica de disponibilidad por target (usando up o equivalente)
-
-Exportar status codes por tipo: 2xx, 4xx, 5xx
-
-Implementar trazas (OpenTelemetry Traces)
-
-Registrar visitas reales si se controla el backend (no aplicable para sitios externos)
-
-Integrar con Grafana OnCall para alertas reales
-
-📅 Licencia y uso
-
-Proyecto realizado con fines educativos y de portafolio personal DevOps/Backend.
-
-✅ Autor: Sebastián
-
-✅ Instancia Grafana: https://disorted.grafana.net
-
-✅ Monitoreo en tiempo real: Railway + OTEL + Grafana Cloud
+```bash
+python -m unittest discover -s tests
+```
